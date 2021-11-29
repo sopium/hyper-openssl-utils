@@ -1,0 +1,16 @@
+[package]
+name = "openssl-server"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.50"
+foreign-types = "0.3.0"
+hyper = { version = "0.14.15", features = ["http1", "runtime", "tcp", "client", "server"] }
+libc = "0.2.108"
+openssl = "0.10.38"
+openssl-sys = "0.9.71"
+tokio = { version = "1.14.0", features = ["net", "time", "sync", "macros"] }
+tracing = "0.1.29"
