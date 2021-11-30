@@ -26,6 +26,7 @@ use tokio::{
     net::TcpStream,
     sync::{mpsc::Receiver, watch},
     task::JoinHandle,
+    time::timeout,
 };
 use tokio_openssl::SslStream;
 
@@ -216,7 +217,11 @@ impl Drop for TlsAddrIncoming {
 }
 
 impl TlsAddrIncoming {
-    pub fn new(mut addr_incoming: AddrIncoming, acceptor: SslAcceptor) -> Self {
+    pub fn new(
+        mut addr_incoming: AddrIncoming,
+        acceptor: SslAcceptor,
+        handshake_timeout: Duration,
+    ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let handle = tokio::spawn(async move {
             loop {
@@ -229,7 +234,11 @@ impl TlsAddrIncoming {
                         tokio::spawn(async move {
                             if let Ok(ssl) = Ssl::new(acceptor.context()) {
                                 if let Ok(mut stream) = SslStream::new(ssl, stream) {
-                                    if Pin::new(&mut stream).accept().await.is_ok() {
+                                    if matches!(
+                                        timeout(handshake_timeout, Pin::new(&mut stream).accept())
+                                            .await,
+                                        Ok(Ok(_))
+                                    ) {
                                         let _ = tx
                                             .send(Ok(TlsAddrStream {
                                                 remote_addr,
