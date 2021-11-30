@@ -1,6 +1,8 @@
-Easily build TLS/https server with openssl and tokio/hyper.
+Easily build TLS/https server with tokio/hyper and openssl.
 
 ## Features
+
+* TlsAddrIncoming for easily creating https servers with hyper and openssl.
 
 * OCSP stapling, with automatic OCSP response fetching, caching and refreshing.
 

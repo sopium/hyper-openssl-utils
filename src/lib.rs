@@ -1,18 +1,33 @@
 use foreign_types::ForeignTypeRef;
+use futures_util::future::poll_fn;
 use hyper::{
     body::{to_bytes, Bytes},
     header::HeaderValue,
+    server::{accept::Accept, conn::AddrIncoming},
     Client, Request,
 };
 use libc::{c_uint, timegm, tm};
 use openssl::{
     hash::MessageDigest,
     ocsp::{OcspCertId, OcspCertStatus, OcspRequest, OcspResponse, OcspResponseStatus},
+    ssl::{Ssl, SslAcceptor},
     x509::X509,
 };
 use openssl_sys::{ASN1_GENERALIZEDTIME, ASN1_TIME};
-use std::time::{Duration, SystemTime};
-use tokio::sync::watch;
+use std::{
+    fmt, io, mem,
+    net::SocketAddr,
+    pin::Pin,
+    task::{self, Poll},
+    time::{Duration, SystemTime},
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+    sync::{mpsc::Receiver, watch},
+    task::JoinHandle,
+};
+use tokio_openssl::SslStream;
 
 extern "C" {
     fn ASN1_TIME_to_tm(t: *const ASN1_TIME, tm: *mut tm) -> c_uint;
@@ -27,8 +42,8 @@ pub struct GetOcspResult {
 #[derive(Debug)]
 pub struct NoOcspResponderError;
 
-impl std::fmt::Display for NoOcspResponderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for NoOcspResponderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "No OCSP Responder")
     }
 }
@@ -36,7 +51,7 @@ impl std::fmt::Display for NoOcspResponderError {
 impl std::error::Error for NoOcspResponderError {}
 
 fn asn1_time_to_system_time(t: *mut ASN1_GENERALIZEDTIME) -> SystemTime {
-    let mut tm = unsafe { std::mem::zeroed() };
+    let mut tm = unsafe { mem::zeroed() };
     let t = unsafe {
         ASN1_TIME_to_tm(t as *mut ASN1_TIME, &mut tm);
         timegm(&mut tm)
@@ -175,4 +190,123 @@ pub fn spawn_get_ocsp(cert: &X509, issuer: &X509) -> watch::Receiver<Option<Byte
         }
     });
     rx
+}
+
+pub struct TlsAddrIncoming {
+    rx: Receiver<io::Result<TlsAddrStream>>,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+pub struct TlsAddrStream {
+    remote_addr: SocketAddr,
+    stream: SslStream<TcpStream>,
+}
+
+impl fmt::Debug for TlsAddrIncoming {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsAddrIncoming").finish()
+    }
+}
+
+impl Drop for TlsAddrIncoming {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl TlsAddrIncoming {
+    pub fn new(mut addr_incoming: AddrIncoming, acceptor: SslAcceptor) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let handle = tokio::spawn(async move {
+            loop {
+                match poll_fn(|cx| Pin::new(&mut addr_incoming).poll_accept(cx)).await {
+                    Some(Ok(stream)) => {
+                        let remote_addr = stream.remote_addr();
+                        let stream = stream.into_inner();
+                        let tx = tx.clone();
+                        let acceptor = acceptor.clone();
+                        tokio::spawn(async move {
+                            if let Ok(ssl) = Ssl::new(acceptor.context()) {
+                                if let Ok(mut stream) = SslStream::new(ssl, stream) {
+                                    if Pin::new(&mut stream).accept().await.is_ok() {
+                                        let _ = tx
+                                            .send(Ok(TlsAddrStream {
+                                                remote_addr,
+                                                stream,
+                                            }))
+                                            .await;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Some(Err(e)) => {
+                        if tx.send(Err(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+        Self { rx, handle }
+    }
+}
+
+impl Accept for TlsAddrIncoming {
+    type Conn = TlsAddrStream;
+
+    type Error = io::Error;
+
+    fn poll_accept(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+impl TlsAddrStream {
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    pub fn into_inner(self) -> SslStream<TcpStream> {
+        self.stream
+    }
+}
+
+impl AsyncRead for TlsAddrStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TlsAddrStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
